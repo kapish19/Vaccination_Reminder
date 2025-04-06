@@ -44,7 +44,7 @@ def safe_generate_content(model, prompt_content, max_retries=3, initial_delay=1)
         try:
             response = model.generate_content(
                 prompt_content,
-                generation_config={"temperature": 0}
+                generation_config={"temperature": 0.3}  # Slightly more creative but still factual
             )
             return response
         except Exception as e:
@@ -207,6 +207,7 @@ def render_instructions():
         3. **Ask Questions**
            - Type your questions in the chat box below
            - Get personalized answers based on your vaccination records
+           - Ask about vaccine schedules, side effects, travel vaccines, etc.
 
         4. **Get Reminders**
            - The system will show upcoming vaccine due dates
@@ -240,36 +241,75 @@ def render_sidebar():
                         st.info(f"Note: Some requests required retries due to API limits. Total retries: {st.session_state.api_retry_count}")
                     st.balloons()
 
+def generate_chat_response(prompt):
+    """Generate appropriate response based on user prompt and available data"""
+    current_date = time.strftime('%Y-%m-%d')
+    
+    # System prompt for generic vaccination questions
+    generic_prompt = """
+    You are a Vaccination Expert Assistant with the following capabilities:
+    
+    1. For GENERAL vaccination questions (without personal data):
+    - Provide accurate, up-to-date information about vaccines
+    - Explain vaccine schedules, side effects, precautions
+    - Offer travel vaccination advice
+    - Compare different vaccine brands
+    - Explain vaccine efficacy and duration
+    
+    2. For PERSONALIZED questions (when vaccination card is uploaded):
+    - Answer based on the user's specific vaccination history
+    - Identify missing vaccines based on age/health conditions
+    - Calculate due dates for next doses
+    - Provide personalized precautions
+    
+    3. Response Guidelines:
+    - Be concise but thorough (3-5 sentences for most answers)
+    - Use bullet points for lists of side effects/precautions
+    - Always cite reputable sources when possible
+    - If unsure, recommend consulting a healthcare provider
+    - For age/condition specific advice, ask for clarification if needed
+    
+    Current Date: {current_date}
+    """
+    
+    if st.session_state.vaccination_card_processed:
+        # Personalized response with vaccination data
+        vaccination_context = f"""
+        User's Vaccination Data:
+        {json.dumps(st.session_state.vaccination_data, indent=2)}
+        """
+        
+        full_prompt = f"{generic_prompt}\n\n{vaccination_context}\n\nQuestion: {prompt}"
+    else:
+        # Generic response without personal data
+        full_prompt = f"{generic_prompt}\n\nQuestion: {prompt}"
+    
+    try:
+        response = safe_generate_content(text_model, full_prompt)
+        return response.text
+    except Exception as e:
+        return f"Sorry, I'm having trouble answering right now. Please try again later. (Error: {str(e)})"
+
 def render_chat_interface():
     st.title("💉 Vaccination Assistance Chatbot")
     render_instructions()
     
+    # Display chat messages
     for message in st.session_state.messages:
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
     
+    # Chat input
     if prompt := st.chat_input("Ask about your vaccinations..."):
         st.session_state.messages.append({"role": "user", "content": prompt})
         with st.chat_message("user"):
             st.markdown(prompt)
         
         with st.chat_message("assistant"):
-            if not st.session_state.vaccination_card_processed:
-                st.warning("Please upload your vaccination card first")
-            else:
-                try:
-                    response = safe_generate_content(
-                        text_model,
-                        f"Based on this vaccination data: {json.dumps(st.session_state.vaccination_data, indent=2)}\n\n"
-                        f"Answer this question: {prompt}\n\n"
-                        f"Be concise and factual. Current date is {time.strftime('%Y-%m-%d')}"
-                    )
-                    st.markdown(response.text)
-                    st.session_state.messages.append({"role": "assistant", "content": response.text})
-                except Exception as e:
-                    error_msg = f"Sorry, I'm having trouble answering right now. Please try again later. (Error: {str(e)})"
-                    st.markdown(error_msg)
-                    st.session_state.messages.append({"role": "assistant", "content": error_msg})
+            with st.spinner("Thinking..."):
+                response = generate_chat_response(prompt)
+                st.markdown(response)
+                st.session_state.messages.append({"role": "assistant", "content": response})
 
 def render_vaccination_details():
     if st.session_state.vaccination_card_processed:
