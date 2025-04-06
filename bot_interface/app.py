@@ -6,6 +6,7 @@ import json
 import time
 from dotenv import load_dotenv
 import os
+import random
 
 # Load environment variables
 load_dotenv()
@@ -17,7 +18,7 @@ vision_model = genai.GenerativeModel('gemini-1.5-pro-latest')
 
 # Configure the app
 st.set_page_config(
-    page_title="Vaccination Reminder Chatbot",
+    page_title="Vaccination Assistance Chatbot",
     page_icon="💉",
     layout="wide"
 )
@@ -31,9 +32,36 @@ if "vaccination_card_processed" not in st.session_state:
     st.session_state.vaccination_card_processed = False
 if "last_uploaded_file" not in st.session_state:
     st.session_state.last_uploaded_file = None
+if "api_retry_count" not in st.session_state:
+    st.session_state.api_retry_count = 0
+
+def safe_generate_content(model, prompt_content, max_retries=3, initial_delay=1):
+    """Wrapper for generate_content with retry logic and error handling"""
+    retry_count = 0
+    delay = initial_delay
+    
+    while retry_count < max_retries:
+        try:
+            response = model.generate_content(
+                prompt_content,
+                generation_config={"temperature": 0}
+            )
+            return response
+        except Exception as e:
+            if "429" in str(e):
+                retry_count += 1
+                st.session_state.api_retry_count += 1
+                wait_time = delay * (2 ** (retry_count - 1)) + random.uniform(0, 1)
+                st.warning(f"API rate limit reached. Retry {retry_count}/{max_retries} in {wait_time:.1f} seconds...")
+                time.sleep(wait_time)
+                delay *= 2  # Exponential backoff
+            else:
+                raise e
+    
+    raise Exception(f"API request failed after {max_retries} retries")
 
 def extract_vaccination_data(image_bytes):
-    """Extract vaccination details from card image"""
+    """Extract vaccination details from card image with error handling"""
     prompt = """
     You are a medical document specialist analyzing a vaccination card. Extract ALL details including:
     1. PATIENT INFORMATION:
@@ -74,14 +102,17 @@ def extract_vaccination_data(image_bytes):
     
     try:
         image = Image.open(io.BytesIO(image_bytes))
-        response = vision_model.generate_content(
-            [prompt, image],
-            generation_config={"response_mime_type": "application/json"}
+        response = safe_generate_content(
+            vision_model,
+            [prompt, image]
         )
         
+        # Clean response to extract JSON
         response_text = response.text
-        if response_text.startswith('```json'):
-            response_text = response_text[7:-3]
+        if '```json' in response_text:
+            response_text = response_text.split('```json')[1].split('```')[0]
+        elif '```' in response_text:
+            response_text = response_text.split('```')[1]
         
         return json.loads(response_text)
     except Exception as e:
@@ -89,32 +120,45 @@ def extract_vaccination_data(image_bytes):
         return None
 
 def get_vaccine_precautions(vaccine_name):
-    """Get 2-3 precautions for a specific vaccine"""
-    prompt = f"""
-    Provide exactly 2-3 important precautions for someone about to receive a {vaccine_name} vaccine.
-    Return as a JSON array only:
-    {{
-        "precautions": []
-    }}
-    """
-    
+    """Get 2-3 precautions for a specific vaccine with fallback"""
     try:
-        response = text_model.generate_content(
-            prompt,
-            generation_config={"response_mime_type": "application/json"}
-        )
+        prompt = f"""
+        Provide exactly 2-3 important precautions for someone about to receive a {vaccine_name} vaccine.
+        Return as a JSON array only:
+        {{
+            "precautions": []
+        }}
+        """
+        
+        response = safe_generate_content(text_model, prompt)
         response_text = response.text
-        if response_text.startswith('```json'):
-            response_text = response_text[7:-3]
+        if '```json' in response_text:
+            response_text = response_text.split('```json')[1].split('```')[0]
         return json.loads(response_text)["precautions"]
-    except:
-        return [
-            "Consult your doctor before vaccination",
-            "Inform about any allergies"
-        ]
+    except Exception:
+        # Fallback precautions if API fails
+        fallback_precautions = {
+            "COVID-19": [
+                "Monitor for allergic reactions for 15-30 minutes after vaccination",
+                "Inform your doctor about any history of blood clotting disorders",
+                "Stay hydrated and rest after vaccination"
+            ],
+            "Flu": [
+                "Inform your doctor if you have egg allergies",
+                "Avoid vaccination if you currently have a fever",
+                "Mild flu-like symptoms are common for 1-2 days after vaccination"
+            ],
+            "default": [
+                "Consult your doctor before vaccination",
+                "Inform about any allergies or medical conditions",
+                "Stay at the clinic for observation for 15-30 minutes after vaccination"
+            ]
+        }
+        
+        return fallback_precautions.get(vaccine_name, fallback_precautions["default"])
 
 def process_uploaded_file(uploaded_file):
-    """Process uploaded vaccination card file"""
+    """Process uploaded vaccination card file with enhanced error handling"""
     try:
         # Reset previous state for new upload
         st.session_state.vaccination_card_processed = False
@@ -145,7 +189,35 @@ def process_uploaded_file(uploaded_file):
     except Exception as e:
         return {"error": f"File processing error: {str(e)}"}
 
-# UI Components
+def render_instructions():
+    with st.expander("ℹ️ How to Use This Chatbot", expanded=True):
+        st.markdown("""
+        **Welcome to the Vaccination Assistance Chatbot!** Here's how to use it:
+
+        1. **Upload Your Vaccination Card**
+           - Click 'Browse files' in the sidebar
+           - Select a clear photo of your vaccination card (JPEG/PNG)
+           - Wait for the system to process your card
+
+        2. **View Your Vaccination Details**
+           - After processing, your vaccination history will appear
+           - See upcoming due vaccines with precautions
+           - Check your personal information for accuracy
+
+        3. **Ask Questions**
+           - Type your questions in the chat box below
+           - Get personalized answers based on your vaccination records
+
+        4. **Get Reminders**
+           - The system will show upcoming vaccine due dates
+           - See important precautions for each vaccine
+
+        **Tips for Best Results:**
+        - Ensure your vaccination card photo is clear and well-lit
+        - Check that all text on the card is readable
+        - Ask specific questions for the most accurate answers
+        """)
+
 def render_sidebar():
     with st.sidebar:
         st.header("📄 Upload Vaccination Card")
@@ -156,7 +228,6 @@ def render_sidebar():
         )
         
         if uploaded_file is not None:
-            # Check if this is a new file
             if (st.session_state.last_uploaded_file != uploaded_file.name or 
                 not st.session_state.vaccination_card_processed):
                 
@@ -165,10 +236,13 @@ def render_sidebar():
                     st.error(result["error"])
                 else:
                     st.success("Vaccination card processed successfully!")
+                    if st.session_state.api_retry_count > 0:
+                        st.info(f"Note: Some requests required retries due to API limits. Total retries: {st.session_state.api_retry_count}")
                     st.balloons()
 
 def render_chat_interface():
-    st.title("💉 Vaccination Specialist Chatbot")
+    st.title("💉 Vaccination Assistance Chatbot")
+    render_instructions()
     
     for message in st.session_state.messages:
         with st.chat_message(message["role"]):
@@ -183,26 +257,32 @@ def render_chat_interface():
             if not st.session_state.vaccination_card_processed:
                 st.warning("Please upload your vaccination card first")
             else:
-                response = text_model.generate_content(
-                    f"Based on this vaccination data: {json.dumps(st.session_state.vaccination_data, indent=2)}\n\n"
-                    f"Answer this question: {prompt}\n\n"
-                    "Be concise and factual. Current date is {time.strftime('%Y-%m-%d')}"
-                )
-                st.markdown(response.text)
-                st.session_state.messages.append({"role": "assistant", "content": response.text})
+                try:
+                    response = safe_generate_content(
+                        text_model,
+                        f"Based on this vaccination data: {json.dumps(st.session_state.vaccination_data, indent=2)}\n\n"
+                        f"Answer this question: {prompt}\n\n"
+                        f"Be concise and factual. Current date is {time.strftime('%Y-%m-%d')}"
+                    )
+                    st.markdown(response.text)
+                    st.session_state.messages.append({"role": "assistant", "content": response.text})
+                except Exception as e:
+                    error_msg = f"Sorry, I'm having trouble answering right now. Please try again later. (Error: {str(e)})"
+                    st.markdown(error_msg)
+                    st.session_state.messages.append({"role": "assistant", "content": error_msg})
 
 def render_vaccination_details():
     if st.session_state.vaccination_card_processed:
-        st.subheader("📋 Your Vaccination Details")
+        st.subheader("📋 Your Vaccination Records")
         data = st.session_state.vaccination_data
         
-        with st.expander("👤 Patient Information"):
+        with st.expander("👤 Personal Information"):
             if "patient_info" in data:
                 st.write(f"**Name:** {data['patient_info'].get('name', 'N/A')}")
                 st.write(f"**Date of Birth:** {data['patient_info'].get('dob', 'N/A')}")
                 st.write(f"**Patient ID:** {data['patient_info'].get('patient_id', 'N/A')}")
         
-        with st.expander("💉 Vaccines Received"):
+        with st.expander("💉 Vaccination History"):
             if "vaccines_received" in data and data["vaccines_received"]:
                 for vax in data["vaccines_received"]:
                     st.write(f"**{vax.get('name', 'Vaccine')}**")
@@ -211,7 +291,7 @@ def render_vaccination_details():
             else:
                 st.write("No vaccination history found")
         
-        with st.expander("⚠️ Due Vaccines & Precautions"):
+        with st.expander("⚠️ Upcoming Vaccines & Precautions"):
             if "due_vaccines" in data and data["due_vaccines"]:
                 for vax in data["due_vaccines"]:
                     st.write(f"**{vax.get('name', 'Vaccine')}**")
